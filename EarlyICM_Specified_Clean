@@ -1,0 +1,126 @@
+cat > plot_with_early_icm_te_clean.py <<'PY'
+import os, re, numpy as np, pandas as pd, matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+DATA_DIR = os.environ["DATA_DIR"]
+OUT_DIR  = os.environ["OUT_DIR"]
+
+counts_path = os.path.join(DATA_DIR, "Human_Embryo_Counts.csv")
+meta_path   = os.path.join(DATA_DIR, "Human_Sample_Info.csv")
+umap_path   = os.path.join(OUT_DIR,  "umap.npy")
+plots_dir   = os.path.join(OUT_DIR,  "Plots")
+os.makedirs(plots_dir, exist_ok=True)
+
+# --- Load ---
+U = np.load(umap_path)
+counts = pd.read_csv(counts_path, index_col=0)
+meta   = pd.read_csv(meta_path, index_col=0).reindex(counts.index)
+
+# --- Labels ---
+label_col = None
+for c in ["Manual_Annotations","Manual_Annotation","ManualLabels",
+          "Stirparo_Labels","Stirparo_Label","Label"]:
+    if c in meta.columns:
+        label_col = c; break
+if label_col is None:
+    raise SystemExit("No label column found.")
+
+labels_raw = meta[label_col].astype(str).fillna("Unassigned")
+
+CANON = ["8-cell","Morula","ICM/TE branch","ICM","Epi/Hyp branch","Hyp",
+         "preIm-Epi","Embryonic disc","ExE-Mes","Early TE","Mid TE",
+         "Mural TE","Polar TE","cTB","sTB"]
+
+def norm(s):
+    s0 = s.strip(); s1 = re.sub(r"[\s\-\_]+"," ",s0).lower()
+    if s1=="8 cell" or ("8" in s1 and "cell" in s1): return "8-cell"
+    if "icm" in s1 and "te" in s1 and "branch" in s1: return "ICM/TE branch"
+    if "epi" in s1 and "hyp" in s1 and "branch" in s1: return "Epi/Hyp branch"
+    if "hypo" in s1 or "hypoblast" in s1 or s1 in {"pe","pre"}: return "Hyp"
+    if "pre" in s1 and "epi" in s1: return "preIm-Epi"
+    if ("post" in s1 or "disc" in s1 or "disk" in s1) and "epi" in s1: return "Embryonic disc"
+    if "exe" in s1 and ("mes" in s1 or "mech" in s1): return "ExE-Mes"
+    if "mural" in s1 and "te" in s1: return "Mural TE"
+    if "polar" in s1 and "te" in s1: return "Polar TE"
+    if "ctb" in s1 or "cytotroph" in s1: return "cTB"
+    if "syncyt" in s1 or s1=="stb": return "sTB"
+    m = {k.lower():k for k in CANON}
+    if s1 in m: return m[s1]
+    return None   # unrecognized → drop later
+
+labels = labels_raw.map(norm)
+idx = counts.index.to_numpy()
+
+# --- Centroids ---
+def centroid(names):
+    m = np.isin(labels.values, names)
+    return U[m].mean(axis=0) if m.any() else None
+
+morula_c = centroid(["Morula"])
+icm_c    = centroid(["ICM"])
+te_c     = centroid(["Early TE"])
+if te_c is None:
+    te_c = centroid(["Early TE","Mid TE","Mural TE","Polar TE","cTB","sTB"])
+
+if morula_c is None or icm_c is None or te_c is None:
+    raise SystemExit("Need Morula, ICM, TE groups present.")
+
+# --- Define Early-ICM and Early-TE ---
+branch_mask = (labels.values=="ICM/TE branch")
+B = U[branch_mask]
+Brel = B - morula_c
+v_icm = icm_c - morula_c
+
+t_icm = (Brel @ v_icm) / (np.dot(v_icm, v_icm)+1e-12)
+d_perp_icm = np.linalg.norm(Brel - np.outer(t_icm, v_icm), axis=1)
+d_to_icm = np.linalg.norm(B-icm_c, axis=1)
+d_to_te  = np.linalg.norm(B-te_c, axis=1)
+
+between_icm = (t_icm>=0)&(t_icm<=1)
+thr = np.percentile(d_perp_icm,60)
+near_line = d_perp_icm<=thr
+
+early_icm_flag = between_icm & (d_to_icm<d_to_te) & near_line
+early_te_flag  = between_icm & (d_to_te<d_to_icm) & near_line
+
+labels_expanded = labels.copy()
+labels_expanded.iloc[np.where(branch_mask)[0][early_icm_flag]] = "Early-ICM"
+labels_expanded.iloc[np.where(branch_mask)[0][early_te_flag]]  = "Early-TE"
+
+# --- Remove unclassified (None) ---
+mask_valid = labels_expanded.notna()
+U = U[mask_valid.values]
+labels_expanded = labels_expanded[mask_valid]
+print(f"[INFO] Dropped {np.sum(~mask_valid.values)} unclassified cells")
+
+# --- Palette ---
+palette = {
+    "8-cell":"#1f77b4","Morula":"#e377c2","ICM/TE branch":"#a6cee3",
+    "ICM":"#8b0000","Early-ICM":"#ff4500","Early-TE":"#00bfc4",
+    "Epi/Hyp branch":"#9467bd","Hyp":"#1f77b4","preIm-Epi":"#bcbd22",
+    "Embryonic disc":"#4b0082","ExE-Mes":"#ff7f0e","Early TE":"#17becf",
+    "Mid TE":"#ff00aa","Mural TE":"#ff7f0e","Polar TE":"#8c564b",
+    "cTB":"#c49c94","sTB":"#aec7e8"
+}
+order = CANON + ["Early-ICM","Early-TE"]
+
+# --- Plot ---
+plt.figure(figsize=(7,6), dpi=300)
+for lab in order:
+    m = (labels_expanded.values==lab)
+    if m.any():
+        plt.scatter(U[m,0], U[m,1], s=6, alpha=0.85,
+                    label=lab, c=palette.get(lab,"#bbbbbb"), linewidths=0)
+
+plt.xticks([]); plt.yticks([])
+plt.xlabel("UMAP-1"); plt.ylabel("UMAP-2")
+plt.title("Human embryo (cESFW) with Early-ICM / Early-TE subsets", pad=10)
+plt.legend(loc="center left", bbox_to_anchor=(1.02,0.5), frameon=False, markerscale=2, fontsize=7)
+plt.tight_layout()
+out_png = os.path.join(plots_dir,"UMAP_with_EarlyICM_EarlyTE_clean.png")
+plt.savefig(out_png,bbox_inches="tight")
+print("[OK] wrote:", out_png)
+PY
+
+python plot_with_early_icm_te_clean.py
