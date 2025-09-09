@@ -1,0 +1,142 @@
+cat > define_early_icm.py <<'PY'
+import os, re, numpy as np, pandas as pd, matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+DATA_DIR = os.environ["DATA_DIR"]
+OUT_DIR  = os.environ["OUT_DIR"]
+counts_path = os.path.join(DATA_DIR, "Human_Embryo_Counts.csv")
+meta_path   = os.path.join(DATA_DIR, "Human_Sample_Info.csv")
+umap_path   = os.path.join(OUT_DIR,  "umap.npy")
+plots_dir   = os.path.join(OUT_DIR,  "Plots")
+os.makedirs(plots_dir, exist_ok=True)
+
+# --- Load UMAP + metadata ---
+U = np.load(umap_path)  # (n_cells, 2)
+counts = pd.read_csv(counts_path, index_col=0)     # just for cell order/index
+meta   = pd.read_csv(meta_path, index_col=0).reindex(counts.index)
+
+# --- Pull labels (authors' manual annotations if present) ---
+label_col = None
+for c in ["Manual_Annotations","Manual_Annotation","ManualLabels",
+          "Stirparo_Labels","Stirparo_Label","Label"]:
+    if c in meta.columns:
+        label_col = c; break
+if label_col is None:
+    raise SystemExit("No label column found (Manual_Annotations etc.).")
+
+labels_raw = meta[label_col].astype(str).fillna("Unassigned")
+
+# --- Normalize labels lightly (same canon as before) ---
+CANON = ["8-cell","Morula","ICM/TE branch","ICM","Epi/Hyp branch","Hyp",
+         "preIm-Epi","Embryonic disc","ExE-Mes",
+         "Early TE","Mid TE","Mural TE","Polar TE","cTB","sTB"]
+def norm(s):
+    s0 = s.strip()
+    s1 = re.sub(r"[\s\-\_]+"," ",s0).lower()
+    # quick canonical catches
+    m = {k.lower():k for k in CANON}
+    if s1 in m: return m[s1]
+    if "8" in s1 and "cell" in s1: return "8-cell"
+    if "icm" in s1 and "te" in s1 and "branch" in s1: return "ICM/TE branch"
+    if "epi" in s1 and "hyp" in s1 and "branch" in s1: return "Epi/Hyp branch"
+    if "hypo" in s1 or "hypoblast" in s1 or s1 in {"pe","pre"}: return "Hyp"
+    if "pre" in s1 and "epi" in s1: return "preIm-Epi"
+    if ("post" in s1 or "disc" in s1 or "disk" in s1) and "epi" in s1: return "Embryonic disc"
+    if "exe" in s1 and ("mes" in s1 or "mech" in s1): return "ExE-Mes"
+    if "mural" in s1 and "te" in s1: return "Mural TE"
+    if "polar" in s1 and "te" in s1: return "Polar TE"
+    if "ctb" in s1 or "cytotroph" in s1: return "cTB"
+    if "syncyt" in s1 or s1=="stb": return "sTB"
+    return s0
+
+labels = labels_raw.map(norm)
+idx = counts.index.to_numpy()  # cell IDs aligned to U
+
+# --- Helper: centroid of a group if it exists ---
+def centroid(name_list):
+    m = np.isin(labels.values, name_list)
+    return U[m].mean(axis=0) if m.any() else None
+
+# Prefer Early TE centroid; fallback to pooled TE if Early TE missing
+TE_GROUPS = ["Early TE","Mid TE","Mural TE","Polar TE","cTB","sTB"]
+morula_c = centroid(["Morula"])
+icm_c    = centroid(["ICM"])
+earlyte_c = centroid(["Early TE"])
+te_c = earlyte_c if earlyte_c is not None else centroid(TE_GROUPS)
+
+if morula_c is None or icm_c is None:
+    raise SystemExit("Need Morula and ICM present to define Early-ICM along the path.")
+
+# --- Compute projection onto Morula->ICM line for branch cells ---
+v = icm_c - morula_c
+vn = v / (np.linalg.norm(v) + 1e-12)
+
+branch_mask = (labels.values == "ICM/TE branch")
+B = U[branch_mask]                          # branch coords
+Brel = B - morula_c                         # relative to Morula
+t = (Brel @ v) / (np.dot(v, v) + 1e-12)     # scalar projection in [~0,1] if between
+perp = Brel - np.outer(t, v)                # perpendicular component
+d_perp = np.linalg.norm(perp, axis=1)       # distance to the line
+
+# distances to ICM and TE centroids
+d_icm = np.linalg.norm(B - icm_c, axis=1)
+d_te  = np.linalg.norm(B - te_c, axis=1) if te_c is not None else np.full(B.shape[0], np.inf)
+
+# --- Selection rules for Early-ICM (tune if needed) ---
+# 1) Between Morula and ICM: t in [0,1]
+between = (t >= 0.0) & (t <= 1.0)
+# 2) Closer to ICM than to TE (exclude TE-like)
+not_as_te = d_icm < d_te
+# 3) Near the path (perp distance below a data-driven threshold)
+thr = np.percentile(d_perp, 60)  # keep ~40% closest to the line by default
+near_line = d_perp <= thr
+
+early_icm_branch = between & not_as_te & near_line
+
+# --- Build output table for all branch cells, mark early-ICM subset ---
+branch_ids = idx[branch_mask]
+out_df = pd.DataFrame({
+    "cell_id": branch_ids,
+    "UMAP_1":  B[:,0],
+    "UMAP_2":  B[:,1],
+    "t_Morula_to_ICM": t,
+    "d_perp":  d_perp,
+    "d_to_ICM": d_icm,
+    "d_to_TE":  d_te,
+    "early_ICM_flag": early_icm_branch
+})
+csv_path = os.path.join(plots_dir, "early_ICM_from_branch.csv")
+out_df.to_csv(csv_path, index=False)
+print(f"[OK] Wrote: {csv_path}  (n_early_ICM={early_icm_branch.sum()} / n_branch={len(out_df)})")
+
+# --- Plot: highlight Early-ICM subset on your labeled UMAP ---
+plt.figure(figsize=(7,6), dpi=300)
+# faded all cells
+plt.scatter(U[:,0], U[:,1], s=3, c="#d0d0d0", alpha=0.5, linewidths=0)
+
+# draw ICM/TE branch in light color
+Bm = np.where(branch_mask)[0]
+plt.scatter(B[:,0], B[:,1], s=8, c="#a6cee3", alpha=0.8, linewidths=0, label="ICM/TE branch")
+
+# overlay Early-ICM subset
+Ei = B[early_icm_branch]
+plt.scatter(Ei[:,0], Ei[:,1], s=14, edgecolor="black", facecolor="#e31a1c", linewidths=0.3, label="Early-ICM (subset)")
+
+# centroids
+plt.scatter([morula_c[0]],[morula_c[1]], s=40, c="#e377c2", marker="^", label="Morula centroid")
+plt.scatter([icm_c[0]],[icm_c[1]],     s=40, c="#d62728", marker="^", label="ICM centroid")
+if te_c is not None:
+    plt.scatter([te_c[0]],[te_c[1]],   s=40, c="#17becf", marker="^", label="TE centroid")
+
+plt.xticks([]); plt.yticks([])
+plt.xlabel("UMAP-1"); plt.ylabel("UMAP-2")
+plt.title("Early-ICM (ICM-biased cells within ICM/TE branch)", pad=10)
+plt.legend(loc="center left", bbox_to_anchor=(1.02,0.5), frameon=False, markerscale=1.5, fontsize=8)
+plt.tight_layout()
+png = os.path.join(plots_dir, "UMAP_early_ICM_highlight.png")
+plt.savefig(png, bbox_inches="tight")
+print(f"[OK] Wrote: {png}")
+PY
+
+python define_early_icm.py
