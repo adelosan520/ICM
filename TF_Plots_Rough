@@ -1,0 +1,263 @@
+cat > 06_plot_epi_trajectory_tfs.py <<'PY'
+import os, re, numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+try:
+    import seaborn as sns
+    HAVE_SNS = True
+except Exception:
+    HAVE_SNS = False
+
+DATA_DIR = os.environ.get("DATA_DIR",".")
+OUT_DIR  = os.environ.get("OUT_DIR","./out")
+PLOTS    = Path(OUT_DIR,"Plots"); PLOTS.mkdir(parents=True, exist_ok=True)
+
+# ---------------- TFs of interest ----------------
+REQUESTED = [
+    "KLF4","KLF5","TBX3","ESRRB","ESRRA","SOCS3","MYC","CMYC",
+    "TFCP2L1","OCT4","SOX2","NANOG","GBX2","STAT3","KLF2","KLF17"
+]
+ALIASES = {
+  "MYC":["MYC","CMYC","C-MYC","c-MYC","cMyc","Myc","cMyc1"],
+  "POU5F1":["POU5F1","OCT4","OCT-4","Oct4"],
+  "TFCP2L1":["TFCP2L1","Tfcp2l1","TFCP2L-1"],
+  "SOX2":["SOX2","Sox2"], "NANOG":["NANOG","Nanog"],
+  "KLF4":["KLF4","Klf4"], "KLF5":["KLF5","Klf5"],
+  "KLF2":["KLF2","Klf2"], "KLF17":["KLF17","Klf17"],
+  "TBX3":["TBX3","Tbx3"], "ESRRB":["ESRRB","Esrrb"],
+  "ESRRA":["ESRRA","Esrra","NR3B1"], "SOCS3":["SOCS3","Socs3"],
+  "GBX2":["GBX2","Gbx2"], "STAT3":["STAT3","Stat3"],
+}
+CANON_FOR = {a.upper():canon for canon, alts in ALIASES.items() for a in alts}
+for g in REQUESTED: CANON_FOR.setdefault(g.upper(), g.upper())
+
+# ---------------- helpers ----------------
+def std_index(idx): return pd.Index(idx.astype(str))
+def norm_key(s): return re.sub(r"[^A-Za-z0-9]","",str(s).upper())
+
+def orient_to_cellsxgenes(df, label_ids):
+    r = std_index(label_ids).intersection(std_index(df.index))
+    c = std_index(label_ids).intersection(std_index(df.columns))
+    if len(r) >= len(c):
+        df.index = std_index(df.index); df.columns = std_index(df.columns); return df
+    df = df.T; df.index = std_index(df.index); df.columns = std_index(df.columns); return df
+
+def align_df(df, label_ids):
+    label_ids = std_index(label_ids); df.index = std_index(df.index)
+    common = label_ids.intersection(df.index)
+    if len(common)==0: raise SystemExit("No overlapping cells between matrix and labels.")
+    df = df.loc[common]
+    df = df.loc[label_ids.intersection(df.index)]
+    return df
+
+def build_token_lut(columns):
+    lut = {}
+    for c in map(str, columns):
+        parts = re.split(r"[^A-Za-z0-9\.]+", c)  # split SYMBOL|ENSG, etc.
+        parts += [c]  # include the raw
+        for p in parts:
+            if not p: continue
+            p_nv = p.split(".")[0]              # strip .12
+            for t in (norm_key(p), norm_key(p_nv)):
+                if t: lut.setdefault(t,set()).add(c)
+    return lut
+
+def find_col(df, gene, token_lut):
+    canon = CANON_FOR.get(gene.upper(), gene.upper())
+    aliases = ALIASES.get(canon, [gene])
+    cols = pd.Index(df.columns.astype(str)); lowmap = {c.lower():c for c in cols}
+    # exact / ci
+    for a in aliases:
+        if a in cols: return cols[cols.get_loc(a)], canon
+        if a.lower() in lowmap: return lowmap[a.lower()], canon
+    # token lookup
+    for a in aliases:
+        tk = norm_key(a)
+        if tk in token_lut:
+            cands = sorted(list(token_lut[tk]), key=lambda x: (0 if x.upper()==a.upper() else (1 if a.upper() in x.upper() else 2)))
+            return cands[0], canon
+    return None, canon
+
+# ---------------- load labels ----------------
+labels_path = Path(OUT_DIR,"group_labels.csv")
+if not labels_path.exists(): raise SystemExit("Missing OUT_DIR/group_labels.csv (run step 01).")
+labels = pd.read_csv(labels_path, index_col=0)["group"]; labels.index = std_index(labels.index)
+
+# ---------------- load matrices ----------------
+log1p_path = Path(OUT_DIR,"log1p_normalized_counts.csv")
+counts_path = Path(DATA_DIR,"Human_Embryo_Counts.csv")
+
+if log1p_path.exists():
+    X = pd.read_csv(log1p_path, index_col=0); X.index = std_index(X.index); X = align_df(X, labels.index)
+else:
+    if not counts_path.exists():
+        raise SystemExit("Missing log1p_normalized_counts.csv and raw Human_Embryo_Counts.csv.")
+    counts = pd.read_csv(counts_path, index_col=0); counts = orient_to_cellsxgenes(counts, labels.index); counts = align_df(counts, labels.index)
+    lib = counts.sum(1).replace(0,np.nan); X = np.log1p((counts.T/lib).T*1e4); X.index = std_index(X.index)
+
+labels = labels.loc[X.index]
+
+# ---------------- build EPI trajectory ----------------
+L = labels.copy()
+# pool TE variants
+L = L.replace(["Early TE","Mid TE","Mural TE","Polar TE","cTB","sTB"], "TE")
+# drop ExE-Mes
+keep = (L!="ExE-Mes"); X = X.loc[keep]; L = L.loc[keep]
+
+def canonize(s):
+    s0 = str(s).strip(); s1 = re.sub(r"[\s\-_]+"," ",s0).lower()
+    if "8" in s1 and "cell" in s1: return "8-cell"
+    if s1 in {"morula","late morula","early morula"}: return "Morula"
+    if "early icm" in s1: return "Early-ICM"
+    if s1 in {"icm","inner cell mass"}: return "ICM"
+    if "epi" in s1 and "hyp" in s1 and "branch" in s1: return "Epi/Hyp branch"
+    if "pre" in s1 and "epi" in s1: return "preIm-Epi"
+    if "embryonic" in s1 and ("disc" in s1 or "disk" in s1): return "Embryonic disc"
+    if s1 in {"hyp","hypoblast","primitive endoderm","pe","pre"}: return "Hyp"
+    if s1=="te": return "TE"
+    return s0
+
+L = L.map(canonize)
+TRAJ = ["8-cell","Morula","Early-ICM","ICM","Epi/Hyp branch","preIm-Epi","Hyp","Embryonic disc","TE"]
+present = [g for g in TRAJ if g in L.unique()]; present += [g for g in L.unique() if g not in present]
+L = pd.Categorical(L, categories=present, ordered=True)
+
+# ---------------- resolve TF columns (log1p + raw fallback) ----------------
+token_lut = build_token_lut(X.columns)
+gene_cols = {}
+missing = []
+
+for g in REQUESTED:
+    col, canon = find_col(X, g, token_lut)
+    if col is not None:
+        gene_cols[canon] = col
+    else:
+        missing.append((g, canon))
+
+# Try to inject missing genes from raw counts if available
+if missing and counts_path.exists():
+    counts_raw = pd.read_csv(counts_path, index_col=0); counts_raw = orient_to_cellsxgenes(counts_raw, X.index); counts_raw = align_df(counts_raw, X.index)
+    lut_raw = build_token_lut(counts_raw.columns)
+    lib = counts_raw.sum(1).replace(0,np.nan)
+    for req, canon in list(missing):
+        colname = None
+        for a in ALIASES.get(canon,[req]):
+            tk = norm_key(a)
+            if tk in lut_raw:
+                cands = sorted(list(lut_raw[tk]), key=lambda x:(0 if x.upper()==a.upper() else (1 if a.upper() in x.upper() else 2)))
+                colname = cands[0]; break
+        if colname:
+            # normalize to log1p CPM 10k and attach
+            colvals = np.log1p((counts_raw[colname]/lib)*1e4)
+            X[canon] = colvals.values  # store under canonical name
+            gene_cols[canon] = canon
+            missing.remove((req,canon))
+
+# Report
+presence = pd.DataFrame({
+    "requested": REQUESTED,
+    "canonical": [CANON_FOR.get(g.upper(), g.upper()) for g in REQUESTED],
+    "found_in": [
+        ("log1p" if CANON_FOR.get(g.upper(), g.upper()) in gene_cols and gene_cols[CANON_FOR.get(g.upper(), g.upper())] in X.columns else
+         ("raw_fallback" if CANON_FOR.get(g.upper(), g.upper()) in gene_cols else "missing"))
+        for g in REQUESTED
+    ],
+    "column_used": [gene_cols.get(CANON_FOR.get(g.upper(), g.upper()), "") for g in REQUESTED]
+})
+presence_out = PLOTS / "EPI_trajectory_TF_presence.csv"
+presence.to_csv(presence_out, index=False)
+print("[OK] wrote presence table:", presence_out)
+if (presence["found_in"]=="missing").any():
+    print("[WARN] Still missing:", presence.loc[presence["found_in"]=="missing","requested"].tolist())
+
+if not gene_cols:
+    raise SystemExit("No genes could be matched; see presence table and column preview.")
+    
+# ---------------- tidy long data ----------------
+def to_long(mat, Lcat):
+    # gene_cols keys are canonical names; ensure columns exist
+    cols = [c for c in gene_cols.keys() if c in mat.columns]
+    sub = mat.loc[:, cols].copy()
+    sub["group"] = Lcat
+    long = sub.melt(id_vars="group", var_name="gene", value_name="log1p")
+    return long
+
+long = to_long(X, L)
+
+# ---------------- group means & heatmap ----------------
+means = long.groupby(["gene","group"])["log1p"].mean().reset_index()
+means["group"] = means["group"].astype(str)
+means_out = PLOTS / "EPI_trajectory_TF_group_means_log1p.csv"
+means.to_csv(means_out, index=False); print("[OK] wrote", means_out)
+
+pivot = means.pivot(index="gene", columns="group", values="log1p").fillna(0.0)
+pivot_z = (pivot.subtract(pivot.mean(axis=1), axis=0)).divide(pivot.std(axis=1)+1e-9, axis=0)
+plt.figure(figsize=(1.2*len(pivot_z.columns)+3, 0.5*len(pivot_z.index)+3), dpi=150)
+if HAVE_SNS:
+    sns.heatmap(pivot_z, cmap="vlag", center=0, cbar_kws={"label":"z-score"})
+else:
+    plt.imshow(pivot_z.values, aspect="auto", cmap="coolwarm"); plt.colorbar(label="z-score")
+    plt.yticks(range(pivot_z.shape[0]), pivot_z.index); plt.xticks(range(pivot_z.shape[1]), pivot_z.columns, rotation=45, ha="right")
+plt.title("TFs across EPI trajectory (group-mean z-scores)")
+plt.tight_layout(); plt.savefig(PLOTS/"EPI_trajectory_TF_heatmap_means_zscore.png", dpi=300, bbox_inches="tight")
+plt.close(); print("[OK] wrote", PLOTS/"EPI_trajectory_TF_heatmap_means_zscore.png")
+
+# ---------------- panel: scatter + mean line ----------------
+def plot_panel_line(df, outfile):
+    genes = list(df["gene"].unique()); n=len(genes)
+    if n==0: print("[WARN] No genes to plot."); return
+    cols=min(3,n); rows=int(np.ceil(n/cols))
+    plt.figure(figsize=(5*cols, 3.6*rows), dpi=150)
+    cats=list(df["group"].cat.categories)
+    for i,gene in enumerate(genes,1):
+        ax=plt.subplot(rows,cols,i)
+        sub=df[df["gene"]==gene]
+        m=sub.groupby("group")["log1p"].mean().reindex(cats)
+        ax.plot(range(len(cats)), m.values, "-o", lw=1.5, ms=3)
+        if HAVE_SNS:
+            sns.stripplot(data=sub, x="group", y="log1p", ax=ax, size=1.2, alpha=0.5, jitter=0.25, color="k")
+        else:
+            for xi,grp in enumerate(cats):
+                vals=sub.loc[sub["group"]==grp,"log1p"].values
+                if len(vals):
+                    jit=(np.random.rand(len(vals))-0.5)*0.4
+                    ax.scatter(np.full_like(vals,xi)+jit, vals, s=4, alpha=0.4, c="k")
+        ax.set_title(gene); ax.set_xlabel(""); ax.set_ylabel("log1p")
+        ax.set_xticks(range(len(cats))); ax.set_xticklabels(cats, rotation=45, ha="right")
+    plt.suptitle("TF expression across EPI trajectory (log1p)", y=1.01)
+    plt.tight_layout(rect=[0,0,1,0.98]); plt.savefig(outfile, dpi=300, bbox_inches="tight"); plt.close()
+    print("[OK] wrote", outfile)
+
+plot_panel_line(long, PLOTS/"EPI_trajectory_TF_panel_log1p.png")
+
+# ---------------- optional: faceted boxes (like earlier screenshots) ---------
+def plot_panel_boxes(df, outfile, use_violin=False):
+    genes=list(df["gene"].unique()); n=len(genes)
+    if n==0: print("[WARN] No genes to plot."); return
+    cols=min(4,n); rows=int(np.ceil(n/cols))
+    plt.figure(figsize=(4.8*cols, 3.6*rows), dpi=150)
+    cats=list(df["group"].cat.categories)
+    for i,gene in enumerate(genes,1):
+        ax=plt.subplot(rows,cols,i)
+        sub=df[df["gene"]==gene]
+        if HAVE_SNS:
+            if use_violin:
+                sns.violinplot(data=sub, x="group", y="log1p", ax=ax, inner=None, cut=0)
+            else:
+                sns.boxplot(data=sub, x="group", y="log1p", ax=ax, fliersize=0.5)
+        else:
+            vals=[sub.loc[sub["group"]==g,"log1p"].values for g in cats]
+            ax.boxplot(vals, showfliers=False); ax.set_xticks(range(1,len(cats)+1)); ax.set_xticklabels(cats, rotation=45, ha="right")
+        ax.set_title(gene); ax.set_xlabel(""); ax.set_ylabel("log1p")
+    plt.suptitle("TF expression across pre-implantation trajectory (separate panels)", y=1.02)
+    plt.tight_layout(rect=[0,0,1,0.98]); plt.savefig(outfile, dpi=300, bbox_inches="tight"); plt.close()
+    print("[OK] wrote", outfile)
+
+# boxes (toggle violin=True if you prefer)
+plot_panel_boxes(long, PLOTS/"EPI_trajectory_TF_panel_box.png", use_violin=False)
+
+print("[DONE] Outputs in", PLOTS)
+PY
+
+python 06_plot_epi_trajectory_tfs.py
