@@ -1,0 +1,238 @@
+cat > 07_best_plots.py <<'PY'
+import os, re, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from pathlib import Path
+try:
+    import seaborn as sns
+    HAVE_SNS=True
+except Exception:
+    HAVE_SNS=False
+
+# ---------- paths ----------
+DATA_DIR = os.environ.get("DATA_DIR",".")
+OUT_DIR  = os.environ.get("OUT_DIR","./out")
+PLOTS    = Path(OUT_DIR,"Plots");  PLOTS.mkdir(parents=True, exist_ok=True)
+PSEUDO   = Path(OUT_DIR,"Pseudobulk"); PSEUDO.mkdir(parents=True, exist_ok=True)
+
+# ---------- genesets (editable) ----------
+NAIVE_SET = ["TFCP2L1","ESRRB","KLF4","KLF5"]  # core; add "KLF17" here if you want Early-ICM bias
+MYC_TARGETS_MIN = [
+    # a small, robust subset present in most scRNA matrices (you can expand to Hallmark lists)
+    "NCL","NPM1","EIF4E","EIF3E","POLR2A","HSPD1","LDHA","PKM","GAPDH","ENO1","HNRNPA1",
+    "TUBA1B","RPLP0","RPS3","RPL3","RPS8","RPL13A","HNRNPK","YBX1"
+]
+
+# ---------- helpers ----------
+def std_index(i): return pd.Index(i.astype(str))
+def norm_key(s):  return re.sub(r"[^A-Za-z0-9]","",str(s).upper())
+
+def orient_to_cellsxgenes(df, label_ids):
+    r = std_index(label_ids).intersection(std_index(df.index))
+    c = std_index(label_ids).intersection(std_index(df.columns))
+    if len(r) >= len(c):
+        df.index = std_index(df.index); df.columns = std_index(df.columns); return df
+    df = df.T; df.index = std_index(df.index); df.columns = std_index(df.columns); return df
+
+def align_df(df, ids):
+    ids = std_index(ids); df.index = std_index(df.index)
+    common = ids.intersection(df.index)
+    if len(common)==0: raise SystemExit("No overlapping cell IDs between counts and labels.")
+    return df.loc[common]
+
+def build_token_lut(cols):
+    lut={}
+    for c in map(str, cols):
+        parts = re.split(r"[^A-Za-z0-9\.]+", c) + [c]
+        for p in parts:
+            if not p: continue
+            t1 = norm_key(p); t2 = norm_key(p.split(".")[0])
+            for t in (t1,t2):
+                if t: lut.setdefault(t,set()).add(c)
+    return lut
+
+def find_cols(df, gene_list):
+    lut=build_token_lut(df.columns)
+    found=[]
+    for g in gene_list:
+        tk = norm_key(g)
+        if tk in lut:
+            cands = sorted(list(lut[tk]), key=lambda x:(0 if x.upper()==g.upper() else (1 if g.upper() in x.upper() else 2)))
+            found.append((g, cands[0]))
+    return dict(found)
+
+# ---------- load labels & metadata ----------
+labels = pd.read_csv(Path(OUT_DIR,"group_labels.csv"), index_col=0)["group"]
+labels.index = std_index(labels.index)
+meta_path = Path(DATA_DIR,"Human_Sample_Info.csv")
+meta = pd.read_csv(meta_path, index_col=0)
+meta.index = std_index(meta.index)
+# Try to infer embryo ID column
+EMBRYO_COL = next((c for c in ["Embryo_ID","EmbryoID","Embryo","embryo","Sample","sample"] if c in meta.columns), None)
+if EMBRYO_COL is None:
+    raise SystemExit("Could not find an embryo/sample ID column in Human_Sample_Info.csv (looked for Embryo_ID/Embryo/Sample).")
+embryo_series = meta.reindex(labels.index)[EMBRYO_COL].astype(str)
+
+# ---------- load counts (raw) ----------
+counts = pd.read_csv(Path(DATA_DIR,"Human_Embryo_Counts.csv"), index_col=0)
+counts = orient_to_cellsxgenes(counts, labels.index)
+counts = align_df(counts, labels.index)
+labels = labels.loc[counts.index]
+embryo_series = embryo_series.loc[counts.index]
+
+# ---------- EPI trajectory mapping ----------
+L = labels.copy()
+# pool TE variants
+L = L.replace(["Early TE","Mid TE","Mural TE","Polar TE","cTB","sTB"], "TE")
+# drop ExE-Mes
+keep = (L!="ExE-Mes")
+counts = counts.loc[keep]; L = L.loc[keep]; embryo_series = embryo_series.loc[keep]
+
+def canonize(s):
+    s0=str(s).strip(); s1=re.sub(r"[\s\-_]+"," ",s0).lower()
+    if "8" in s1 and "cell" in s1: return "8-cell"
+    if s1 in {"morula","late morula","early morula"}: return "Morula"
+    if "early icm" in s1: return "Early-ICM"
+    if s1 in {"icm","inner cell mass"}: return "ICM"
+    if "epi" in s1 and "hyp" in s1 and "branch" in s1: return "Epi/Hyp branch"
+    if "pre" in s1 and "epi" in s1: return "preIm-Epi"
+    if "embryonic" in s1 and ("disc" in s1 or "disk" in s1): return "Embryonic disc"
+    if s1 in {"hyp","hypoblast","primitive endoderm","pe","pre"}: return "Hyp"
+    if s1=="te": return "TE"
+    return s0
+
+L = L.map(canonize)
+TRAJ = ["8-cell","Morula","Early-ICM","ICM","Epi/Hyp branch","preIm-Epi","Embryonic disc","TE"]
+present = [g for g in TRAJ if g in L.unique()]
+present += [g for g in L.unique() if g not in present]  # append any extras
+L = pd.Categorical(L, categories=present, ordered=True)
+
+# ---------- CPM(10k) + log1p matrices ----------
+lib = counts.sum(1).replace(0,np.nan)
+CP10k = (counts.T / lib).T * 1e4
+LOG1P = np.log1p(CP10k)
+
+# ---------- resolve columns ----------
+naive_cols = find_cols(counts, NAIVE_SET)
+myct_cols  = find_cols(counts, MYC_TARGETS_MIN)
+# keep intersection
+naive_keep = [naive_cols[g] for g in NAIVE_SET if g in naive_cols]
+myct_keep  = list(set(myct_cols.values()))
+
+if len(naive_keep)==0:
+    print("[WARN] No naïve genes matched in counts; check column names.")
+if len(myct_keep)==0:
+    print("[WARN] No MYC-target genes matched; the target module may be empty.")
+
+# ---------- per-cell module scores ----------
+def module_score(mat, cols):
+    if len(cols)==0: 
+        return pd.Series(np.nan, index=mat.index)
+    sub = mat.loc[:, cols]
+    # z-score per gene then mean across genes (robust to scale)
+    zs  = (sub - sub.mean(0)) / (sub.std(0)+1e-9)
+    return zs.mean(1)
+
+naive_score = module_score(LOG1P, naive_keep)
+myct_score  = module_score(LOG1P, myct_keep)
+
+# ---------- PSEUDOBULK CPM per embryo × state ----------
+df = CP10k.copy()
+df["group"]  = L
+df["embryo"] = embryo_series.values
+# We will summarize genes of interest + modules
+want_genes   = ["ESRRB","MYC"]
+want_cols    = find_cols(counts, want_genes)
+pb_rows=[]
+for (emb, grp), x in df.groupby(["embryo","group"]):
+    if pd.isna(grp): continue
+    row={"embryo":emb, "group":grp}
+    # gene CPM means
+    for g, colname in want_cols.items():
+        row[f"CP10k_{g}"] = x[colname].mean()
+    # module means (use per-cell module scores aligned)
+    idx = x.index
+    row["NAIVE_module"] = naive_score.loc[idx].mean()
+    row["MYCtargets_module"] = myct_score.loc[idx].mean()
+    pb_rows.append(row)
+
+pb = pd.DataFrame(pb_rows)
+pb.to_csv(PSEUDO/"pseudobulk_per_embryo_CP10k.csv", index=False)
+print("[OK] wrote", PSEUDO/"pseudobulk_per_embryo_CP10k.csv")
+
+# ---------- PLOTS 1: pseudobulk boxplots (embryo = replicate) ----------
+def box_by_group(df, value, title, outfile):
+    cats = [g for g in TRAJ if g in df["group"].unique()] + [g for g in df["group"].unique() if g not in TRAJ]
+    df = df[df["group"].isin(cats)].copy()
+    df["group"] = pd.Categorical(df["group"], categories=cats, ordered=True)
+    plt.figure(figsize=(1.1*len(cats)+4, 4), dpi=150)
+    if HAVE_SNS: sns.boxplot(data=df, x="group", y=value, fliersize=2)
+    else:
+        vals=[df.loc[df["group"]==g, value].values for g in cats]
+        plt.boxplot(vals, showfliers=False); plt.xticks(range(1,len(cats)+1), cats, rotation=45, ha="right")
+    plt.ylabel(value.replace("_"," ")); plt.title(title); plt.tight_layout()
+    plt.savefig(outfile, dpi=300, bbox_inches="tight"); plt.close()
+    print("[OK] wrote", outfile)
+
+if "CP10k_ESRRB" in pb.columns:
+    box_by_group(pb, "CP10k_ESRRB", "ESRRB pseudobulk CP10k (per embryo)", PLOTS/"PB_ESRRB_box.png")
+if "CP10k_MYC" in pb.columns:
+    box_by_group(pb, "CP10k_MYC",   "MYC pseudobulk CP10k (per embryo)",   PLOTS/"PB_MYC_box.png")
+box_by_group(pb, "NAIVE_module",       "Naïve module (z-score mean) per embryo", PLOTS/"PB_NAIVE_module_box.png")
+box_by_group(pb, "MYCtargets_module",  "MYC targets module (z-score mean) per embryo", PLOTS/"PB_MYCtargets_module_box.png")
+
+# ---------- PLOTS 2: embryo-mean trajectories with error bands ----------
+def traj_with_sem(df, value, title, outfile):
+    cats = [g for g in TRAJ if g in df["group"].unique()] + [g for g in df["group"].unique() if g not in TRAJ]
+    df = df[df["group"].isin(cats)].copy()
+    df["group"] = pd.Categorical(df["group"], categories=cats, ordered=True)
+    grp = df.groupby("group")[value]
+    mean = grp.mean(); sem = grp.sem()
+    x = np.arange(len(mean))
+    plt.figure(figsize=(1.1*len(cats)+4, 3.5), dpi=150)
+    plt.plot(x, mean.values, "-o", lw=2)
+    plt.fill_between(x, (mean-sem).values, (mean+sem).values, alpha=0.25, edgecolor="none")
+    plt.xticks(x, cats, rotation=45, ha="right")
+    plt.ylabel(value.replace("_"," ")); plt.title(title); plt.tight_layout()
+    plt.savefig(outfile, dpi=300, bbox_inches="tight"); plt.close()
+    print("[OK] wrote", outfile)
+
+if "CP10k_ESRRB" in pb.columns:
+    traj_with_sem(pb, "CP10k_ESRRB", "ESRRB embryo-mean trajectory (CP10k)", PLOTS/"TRAJ_ESRRB_mean_sem.png")
+if "CP10k_MYC" in pb.columns:
+    traj_with_sem(pb, "CP10k_MYC",   "MYC embryo-mean trajectory (CP10k)",   PLOTS/"TRAJ_MYC_mean_sem.png")
+traj_with_sem(pb, "NAIVE_module",      "Naïve module embryo-mean trajectory",     PLOTS/"TRAJ_NAIVE_module_mean_sem.png")
+traj_with_sem(pb, "MYCtargets_module", "MYC targets module embryo-mean trajectory",PLOTS/"TRAJ_MYCtargets_module_mean_sem.png")
+
+# ---------- PLOTS 3: per-cell module score lines (for visual match) ----------
+percell = pd.DataFrame({
+    "NAIVE_module": naive_score,
+    "MYCtargets_module": myct_score,
+    "group": L
+}).dropna()
+
+def percell_lines(df, value, title, outfile):
+    cats=list(df["group"].cat.categories)
+    plt.figure(figsize=(1.1*len(cats)+4, 3.8), dpi=150)
+    # mean line
+    m = df.groupby("group")[value].mean().reindex(cats)
+    plt.plot(range(len(cats)), m.values, "-o", lw=2)
+    # jittered points (thin)
+    if HAVE_SNS:
+        sns.stripplot(data=df, x="group", y=value, size=1.0, alpha=0.3, jitter=0.25, color="k")
+    else:
+        for xi,g in enumerate(cats):
+            vals=df.loc[df["group"]==g,value].values
+            if len(vals): 
+                jit=(np.random.rand(len(vals))-0.5)*0.4
+                plt.scatter(np.full_like(vals,xi)+jit, vals, s=4, alpha=0.3, c="k")
+    plt.xticks(range(len(cats)), cats, rotation=45, ha="right")
+    plt.ylabel(value.replace("_"," ")); plt.title(title); plt.tight_layout()
+    plt.savefig(outfile, dpi=300, bbox_inches="tight"); plt.close()
+    print("[OK] wrote", outfile)
+
+percell_lines(percell, "NAIVE_module",      "Per-cell naïve module (z-score mean)",      PLOTS/"PERCELL_NAIVE_module.png")
+percell_lines(percell, "MYCtargets_module", "Per-cell MYC targets module (z-score mean)", PLOTS/"PERCELL_MYCtargets_module.png")
+
+print("[DONE] Best-evidence plots written to", PLOTS, "and pseudobulk table to", PSEUDO)
+PY
+
+python 07_best_plots.py
