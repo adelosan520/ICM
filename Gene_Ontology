@@ -1,0 +1,206 @@
+cat > 01_define_groups_and_norm.py <<'PY'
+import os, re, numpy as np, pandas as pd, scanpy as sc, anndata as ad
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+DATA_DIR = os.environ.get("DATA_DIR",".")
+OUT_DIR  = os.environ.get("OUT_DIR","./out")
+Path(OUT_DIR,"Plots").mkdir(parents=True, exist_ok=True)
+
+counts_path = os.path.join(DATA_DIR,"Human_Embryo_Counts.csv")
+meta_path   = os.path.join(DATA_DIR,"Human_Sample_Info.csv")
+genes_saved = os.path.join(DATA_DIR,"Saved_cESFW_Genes.npy")
+umap_npy    = os.path.join(OUT_DIR,"umap.npy")
+
+# --- Load UMAP first (source of truth for cell count/order) ---
+if not os.path.exists(umap_npy):
+    raise SystemExit(f"Missing {umap_npy}. Create UMAP first.")
+U = np.load(umap_npy)
+n_cells = U.shape[0]
+
+# --- Load counts (do NOT transpose yet) ---
+counts = pd.read_csv(counts_path, index_col=0)
+# Auto-orient to match UMAP rows
+if counts.shape[0] == n_cells:
+    pass
+elif counts.shape[1] == n_cells:
+    counts = counts.T
+else:
+    raise SystemExit(f"UMAP rows ({n_cells}) do not match counts dims {counts.shape}. "
+                     "Ensure counts are cells x genes or transpose the CSV accordingly.")
+
+# --- Load metadata and align to counts rows ---
+meta = pd.read_csv(meta_path, index_col=0).reindex(counts.index)
+
+# --- Label column ---
+label_col=None
+for c in ["Manual_Annotations","Manual_Annotation","ManualLabels",
+          "Stirparo_Labels","Stirparo_Label","Label"]:
+    if c in meta.columns:
+        label_col=c; break
+if label_col is None: raise SystemExit("No label column in Human_Sample_Info.csv.")
+labels_raw = meta[label_col].astype(str).fillna("Unassigned")
+
+# --- Restrict to cESFW genes (columns only; row count preserved) ---
+if os.path.exists(genes_saved):
+    sel = list(np.load(genes_saved, allow_pickle=True))
+    sel = [g.decode() if isinstance(g,(bytes,bytearray)) else str(g) for g in sel]
+    keep = [g for g in sel if g in counts.columns]
+    if keep:
+        counts = counts.loc[:, keep]
+
+# --- Recheck rows vs UMAP after any filtering (should be unchanged) ---
+if counts.shape[0] != n_cells:
+    raise SystemExit("Row count changed unexpectedly; alignment requires same cells as UMAP.")
+
+# --- Normalize labels to canonical set ---
+CANON=["8-cell","Morula","ICM/TE branch","ICM","Epi/Hyp branch","Hyp",
+       "preIm-Epi","Embryonic disc","ExE-Mes","Early TE","Mid TE",
+       "Mural TE","Polar TE","cTB","sTB"]
+def norm(s):
+    s0=s.strip(); s1=re.sub(r"[\s\-\_]+"," ",s0).lower()
+    if "8" in s1 and "cell" in s1: return "8-cell"
+    if "icm" in s1 and "te" in s1 and "branch" in s1: return "ICM/TE branch"
+    if "epi" in s1 and "hyp" in s1 and "branch" in s1: return "Epi/Hyp branch"
+    if "hypo" in s1 or "hypoblast" in s1 or s1 in {"pe","pre"}: return "Hyp"
+    if "pre" in s1 and "epi" in s1: return "preIm-Epi"
+    if ("post" in s1 or "disc" in s1 or "disk" in s1) and "epi" in s1: return "Embryonic disc"
+    if "exe" in s1 and ("mes" in s1 or "mech" in s1): return "ExE-Mes"
+    if "mural" in s1 and "te" in s1: return "Mural TE"
+    if "polar" in s1 and "te" in s1: return "Polar TE"
+    if "ctb" in s1 or "cytotroph" in s1: return "cTB"
+    if "syncyt" in s1 or s1=="stb": return "sTB"
+    m={k.lower():k for k in CANON}
+    return m.get(s1, None)
+
+labels = labels_raw.map(norm)
+
+# --- Define Early-ICM / Early-TE from branch using U geometry ---
+def centroid(names):
+    m = np.isin(labels.values, names)
+    return U[m].mean(axis=0) if m.any() else None
+
+morula_c = centroid(["Morula"])
+icm_c    = centroid(["ICM"])
+te_c     = centroid(["Early TE"])
+if te_c is None:
+    te_c = centroid(["Early TE","Mid TE","Mural TE","Polar TE","cTB","sTB"])
+
+if morula_c is None or icm_c is None or te_c is None:
+    raise SystemExit("Need Morula, ICM, and TE(-like) groups present to define Early-ICM/TE.")
+
+branch_mask = (labels.values == "ICM/TE branch")
+B = U[branch_mask]; Brel = B - morula_c
+v_icm = icm_c - morula_c
+t_icm = (Brel @ v_icm) / (np.dot(v_icm, v_icm)+1e-12)
+d_perp = np.linalg.norm(Brel - np.outer(t_icm, v_icm), axis=1)
+d_icm  = np.linalg.norm(B - icm_c, axis=1)
+d_te   = np.linalg.norm(B - te_c,  axis=1)
+
+between = (t_icm>=0)&(t_icm<=1)
+thr = np.percentile(d_perp, 60)
+near = d_perp <= thr
+
+early_icm = between & (d_icm < d_te) & near
+early_te  = between & (d_te  < d_icm) & near
+
+labels_exp = labels.copy()
+bidx = np.where(branch_mask)[0]
+labels_exp.iloc[bidx[early_icm]] = "Early-ICM"
+labels_exp.iloc[bidx[early_te]]  = "Early-TE"
+
+# --- Drop unclassified cells (None) and align arrays ---
+keep_cells = labels_exp.notna().values
+if (~keep_cells).any():
+    print(f"[INFO] Dropping {np.sum(~keep_cells)} unclassified cells")
+counts = counts.iloc[keep_cells, :]
+U      = U[keep_cells, :]
+labels_exp = labels_exp[keep_cells]
+
+# --- Build AnnData, normalize + log1p ---
+adata = ad.AnnData(X=counts.values,
+                   obs=pd.DataFrame({"group":labels_exp.values}, index=counts.index),
+                   var=pd.DataFrame(index=counts.columns))
+adata.obsm["X_umap_external"] = U
+sc.pp.normalize_total(adata, target_sum=1e4)
+sc.pp.log1p(adata)
+
+# --- Save outputs ---
+adata.write(os.path.join(OUT_DIR,"embryo_cesfw_groups.h5ad"))
+labels_exp.to_csv(os.path.join(OUT_DIR,"group_labels.csv"), header=["group"])
+pd.DataFrame(U, index=adata.obs_names, columns=["UMAP_1","UMAP_2"]).to_csv(os.path.join(OUT_DIR,"umap_coords.csv"))
+adata.to_df().to_csv(os.path.join(OUT_DIR,"log1p_normalized_counts.csv"))
+
+# --- Plot UMAP with groups ---
+plt.figure(figsize=(7,6))
+for g in sorted(labels_exp.unique()):
+    m=(labels_exp==g).values
+    plt.scatter(U[m,0], U[m,1], s=6, alpha=0.85, label=g)
+plt.xticks([]); plt.yticks([])
+plt.legend(markerscale=2, bbox_to_anchor=(1.02,0.5), loc="center left", frameon=False)
+plt.title("UMAP with groups (incl. Early-ICM / Early-TE)")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR,"Plots/umap_groups_step01.png"), dpi=300, bbox_inches="tight")
+plt.close()
+
+print("[OK] Step 01 complete. Wrote files in", OUT_DIR)
+PY
+
+python 01_define_groups_and_norm.py
+
+
+cat > 03_go_enrichment.py <<'PY'
+import os, numpy as np, pandas as pd
+from pathlib import Path
+import gseapy as gp
+import matplotlib.pyplot as plt
+
+OUT_DIR = os.environ.get("OUT_DIR","./out")
+DE_DIR  = Path(OUT_DIR, "DE")
+GO_DIR  = Path(OUT_DIR, "GO");   GO_DIR.mkdir(parents=True, exist_ok=True)
+PLOT_DIR= Path(OUT_DIR, "Plots"); PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+de_files = list(DE_DIR.glob("*.csv"))
+if not de_files:
+    raise SystemExit("No DE csvs in DE/. Run script 02 first.")
+
+def plot_go_bar(res_df, title, out_png):
+    term_col = "Term" if "Term" in res_df.columns else ("term_name" if "term_name" in res_df.columns else None)
+    padj_col = next((c for c in [
+        "Adjusted P-value","Adjusted P value","Adjusted_p_value","Adjusted_P_value",
+        "Adjusted_p","Adjusted.P.value","Adjusted.P","Adjusted P-value (BH)",
+        "Adjusted P-value (Benjamini-Hochberg)"] if c in res_df.columns), None)
+    if term_col is None or padj_col is None: return False
+    df = res_df[[term_col, padj_col]].dropna().sort_values(padj_col).head(15)
+    if df.empty: return False
+    df["mlog10"] = -np.log10(df[padj_col].clip(lower=1e-300))
+    plt.figure(figsize=(7.5,5)); plt.barh(df[term_col][::-1], df["mlog10"][::-1])
+    plt.xlabel("-log10 adjusted p"); plt.title(title); plt.tight_layout()
+    plt.savefig(out_png, dpi=300); plt.close(); return True
+
+for p in de_files:
+    df = pd.read_csv(p)
+    if "logfoldchanges" not in df.columns or "names" not in df.columns:
+        print(f"[WARN] {p.name}: missing columns; skipping."); continue
+    pcol = "pvals_adj" if "pvals_adj" in df.columns else ("pval" if "pval" in df.columns else None)
+    if pcol:
+        up = df[(df[pcol]<0.05) & (df["logfoldchanges"]>0)].copy().sort_values([pcol,"logfoldchanges"], ascending=[True,False])
+    else:
+        up = df[df["logfoldchanges"]>0].copy().sort_values("logfoldchanges", ascending=False)
+    genes = up["names"].dropna().astype(str).tolist()[:200]
+    if len(genes) < 5:
+        print(f"[WARN] {p.name}: too few up genes; skipping."); continue
+    enr = gp.enrichr(gene_list=genes, gene_sets=["GO_Biological_Process_2023"],
+                     organism="Human", outdir=None, cutoff=0.05, no_plot=True, verbose=False)
+    if enr.res2d is not None and not enr.res2d.empty:
+        out_csv = GO_DIR / p.name.replace(".csv","_GO_BP.csv")
+        enr.res2d.to_csv(out_csv, index=False); print("[OK] wrote", out_csv)
+        ok = plot_go_bar(enr.res2d, f"GO:BP — {p.stem}", PLOT_DIR / f"GO_BP_top15_{p.stem}.png")
+        if ok: print("[OK] wrote", PLOT_DIR / f"GO_BP_top15_{p.stem}.png")
+        else:  print(f"[WARN] {p.name}: could not plot GO bar chart (columns).")
+    else:
+        print(f"[WARN] {p.name}: no significant GO terms.")
+print("[DONE] GO + plots")
+PY
+
+python 03_go_enrichment.py
