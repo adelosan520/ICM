@@ -1,0 +1,60 @@
+cat > 07b_adjust_myc_axis.py <<'PY'
+import os, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from pathlib import Path
+
+OUT_DIR = os.environ.get("OUT_DIR","./out")
+PLOTS   = Path(OUT_DIR,"Plots"); PLOTS.mkdir(parents=True, exist_ok=True)
+TRAJ    = ["8-cell","Morula","Early-ICM","ICM","Epi/Hyp branch","preIm-Epi","Embryonic disc","TE"]
+
+pb = pd.read_csv(Path(OUT_DIR,"Pseudobulk","pseudobulk_per_embryo_CP10k.csv"))
+if "CP10k_MYC" not in pb.columns:
+    raise SystemExit("CP10k_MYC not found in pseudobulk table. Run 07_best_plots.py first.")
+
+# order groups
+cats = [g for g in TRAJ if g in pb["group"].unique()] + [g for g in pb["group"].unique() if g not in TRAJ]
+pb = pb[pb["group"].isin(cats)].copy()
+pb["group"] = pd.Categorical(pb["group"], categories=cats, ordered=True)
+
+# compute y-limits from percentiles
+lo = np.nanpercentile(pb["CP10k_MYC"], 5)
+hi = np.nanpercentile(pb["CP10k_MYC"], 95)
+margin = (hi-lo)*0.15
+ymin, ymax = max(0, lo - margin), hi + margin
+
+# Boxplot per embryo with tighter Y
+plt.figure(figsize=(1.1*len(cats)+4, 4), dpi=150)
+try:
+    import seaborn as sns
+    sns.boxplot(data=pb, x="group", y="CP10k_MYC", fliersize=2)
+except Exception:
+    vals=[pb.loc[pb["group"]==g,"CP10k_MYC"].values for g in cats]
+    plt.boxplot(vals, showfliers=False); plt.xticks(range(1,len(cats)+1), cats, rotation=45, ha="right")
+plt.ylim(ymin, ymax)
+plt.ylabel("MYC CP10k (pseudobulk per embryo)")
+plt.title("MYC pseudobulk (axis-adjusted)")
+plt.tight_layout()
+plt.savefig(PLOTS/"PB_MYC_box_axis_adjusted.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+# Mean ± SEM trajectory with tighter Y
+grp = pb.groupby("group")["CP10k_MYC"]
+mean, sem = grp.mean(), grp.sem()
+x = np.arange(len(mean))
+plt.figure(figsize=(1.1*len(cats)+4, 3.5), dpi=150)
+plt.plot(x, mean.values, "-o", lw=2)
+plt.fill_between(x, (mean-sem).values, (mean+sem).values, alpha=0.25, edgecolor="none")
+plt.xticks(x, cats, rotation=45, ha="right")
+plt.ylim(ymin, ymax)
+plt.ylabel("MYC CP10k (pseudobulk per embryo)")
+plt.title("MYC embryo-mean trajectory (axis-adjusted)")
+plt.tight_layout()
+plt.savefig(PLOTS/"TRAJ_MYC_mean_sem_axis_adjusted.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+print("[OK] wrote:",
+      PLOTS/"PB_MYC_box_axis_adjusted.png",
+      "and",
+      PLOTS/"TRAJ_MYC_mean_sem_axis_adjusted.png")
+PY
+
+python 07b_adjust_myc_axis.py
